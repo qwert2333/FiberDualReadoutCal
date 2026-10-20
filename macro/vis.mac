@@ -1,0 +1,15 @@
+# The full 1 m x 1 m module has ~4.4e5 fibers per z segment; drawing it is slow.
+# For visual checks use a small module first, e.g. /detector/CaloSize 15 mm, /detector/CaloLength 50 mm.
+/vis/open OGL
+/vis/viewer/set/viewpointVector 1 1 1
+/vis/viewer/set/style surface
+/vis/drawVolume
+/vis/viewer/set/autoRefresh true
+/vis/scene/add/trajectories smooth
+/vis/scene/add/scale 1 m
+/vis/scene/add/axes
+/vis/scene/add/eventID
+/vis/scene/endOfEventAction accumulate
+/vis/viewer/flush
+/vis/viewer/set/style wireframe
+/vis/viewer/set/auxiliaryEdge true

@@ -1,0 +1,33 @@
+/random/setSeeds 2077 1010
+
+/run/numberOfThreads 1
+
+/run/setCut 0.1 mm
+
+/run/verbose 1
+/event/verbose 0
+/tracking/verbose 0
+
+# Detector construction (defaults shown; fiber values from NIM A 1090 (2026) 171598, p. 2)
+/detector/CaloSize 1000 mm
+/detector/CaloLength 2000 mm
+/detector/FiberDiameter 1.0 mm
+/detector/FiberPitch 1.5 mm
+/detector/ZSegNum 1
+/detector/AbsorberMaterial Cu
+
+/run/initialize
+
+# Set particle gun (calorimeter front face is at z = 0)
+/gps/particle e-
+/gps/energy 10 GeV
+/gps/direction 0 0 1
+/gps/pos/type Plane
+/gps/pos/shape Square
+/gps/pos/centre 0 0 -50 cm
+/gps/pos/halfx 0. cm
+/gps/pos/halfy 0. cm
+
+
+# Run event number
+/run/beamOn 10
