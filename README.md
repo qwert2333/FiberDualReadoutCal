@@ -4,7 +4,7 @@ Geant4 simulation of a fiber-sampling dual-readout calorimeter, modelled on the
 module described in S.Y. Jang et al., "Performance of dual-readout calorimeters
 for various absorbers", NIM A 1090 (2026) 171598.  The framework (UI commands,
 optical-photon counting, ntuple output, output naming, MT merging) follows
-`../DualReadoutTileCal`.
+[DualReadoutTileCal](https://github.com/qwert2333/DualReadoutTileCal).
 
 Simplifications with respect to the paper: no fiber cladding, no photosensors,
 no yellow filter, and no optical-photon transport.  Optical photons are killed
