@@ -37,6 +37,12 @@ G4bool MySensitiveDetector::ProcessHits(G4Step *aStep, G4TouchableHistory *ROhis
     G4Track *aTrack = aStep->GetTrack(); 
     G4String particleName = aTrack->GetParticleDefinition()->GetParticleName();
 
+    // An optical photon absorbed on its first step (G4OpBoundaryProcess NoRINDEX at the
+    // fiber/absorber boundary, or G4OpAbsorption) reports its own energy as a local
+    // deposit. That energy is not subtracted from the parent's deposit, so it is not
+    // added here; optical photons are only counted below (same as the truth Edep).
+    if (particleName == "opticalphoton") edep = 0.;
+
     const    G4VProcess*  theprocess = aTrack->GetCreatorProcess();
     G4String CreatorprocessName = "None" ;
     if (theprocess != 0) 

@@ -1,0 +1,26 @@
+{
+  "job_name": "fiber_dr_energy_scan",
+  "threads": 5,
+  "detector": {
+    "calo_size": "1000 mm",
+    "calo_length": "2000 mm",
+    "fiber_diameter": "1.0 mm",
+    "fiber_pitch": "1.5 mm",
+    "zseg_num": "100",
+    "absorber_mat": "Cu"
+  },
+  "gps_direction": "0.0858415 0.1730072 0.9811726",
+  "gps_position": "-7 -21 -50 cm",
+  "gps_halfx": "1 cm",
+  "gps_halfy": "1 cm",
+  "output_dirs": {
+    "macros": "outputs/fiber_dr_energy_scan/macros",
+    "root": "outputs/fiber_dr_energy_scan/root",
+    "tables": "outputs/fiber_dr_energy_scan/tables",
+    "plots": "outputs/fiber_dr_energy_scan/plots"
+  },
+  "samples": [
+    {"role": "electron", "particle": "e-", "energies_gev": [1, 5, 10, 20, 30, 50], "events": 2000},
+    {"role": "hadron", "particle": "pi-", "energies_gev": [1, 5, 10, 20, 30, 50], "events": 2000}
+  ]
+}
