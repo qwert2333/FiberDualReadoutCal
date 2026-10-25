@@ -35,11 +35,12 @@ def resolution(values):
 
 
 def fit_resolution_ab(points):
+    """Fit sigma/E = a/sqrt(E) + b, linear sum (paper Eq. 7)."""
     valid = [(float(e), float(r)) for e, r in points if finite(e) and finite(r) and float(e) > 0 and float(r) >= 0]
     if len(valid) < 2:
         return math.nan, math.nan
-    x = [1.0 / e for e, _ in valid]
-    y = [r * r for _, r in valid]
+    x = [1.0 / math.sqrt(e) for e, _ in valid]
+    y = [r for _, r in valid]
     n = len(valid)
     sx = sum(x)
     sy = sum(y)
@@ -48,21 +49,22 @@ def fit_resolution_ab(points):
     denom = n * sxx - sx * sx
     if abs(denom) < 1e-18:
         return math.nan, math.nan
-    a2 = (n * sxy - sx * sy) / denom
-    b2 = (sy - a2 * sx) / n
-    return math.sqrt(max(a2, 0.0)), math.sqrt(max(b2, 0.0))
+    a = (n * sxy - sx * sy) / denom
+    b = (sy - a * sx) / n
+    return a, b
 
 
 def resolution_model(energy, a, b):
     if not finite(a) or not finite(b) or energy <= 0:
         return math.nan
-    return math.sqrt((a * a) / energy + b * b)
+    return a / math.sqrt(energy) + b
 
 
 def fit_label(name, a, b):
     if not finite(a) or not finite(b):
         return f"{name} fit unavailable"
-    return f"{name}: a={100*a:.2f}% sqrt(GeV), b={100*b:.2f}%"
+    print(f"resolution fit {name}: a = {100*a:.2f}% sqrt(GeV), b = {100*b:.2f}%")
+    return f"{name}: {100*a:.2f}%/sqrt(E) + {100*b:.2f}%"
 
 
 def savefig(path):
@@ -135,8 +137,12 @@ def plot_h_over_e_vs_energy(tables, out):
     c_err = [float(row["h_over_e_C_err"]) for row in rows]
 
     plt.figure(figsize=(7.2, 5.2))
-    plt.errorbar(energies, s, yerr=s_err, fmt="o-", capsize=4, label="(h/e)_S")
-    plt.errorbar(energies, c, yerr=c_err, fmt="s-", capsize=4, label="(h/e)_C")
+    plt.errorbar(energies, s, yerr=s_err, fmt="o", capsize=4, label="(h/e)_S")
+    plt.errorbar(energies, c, yerr=c_err, fmt="s", capsize=4, label="(h/e)_C")
+    if "h_over_e_S_model" in rows[0]:
+        plt.plot(energies, [float(row["h_over_e_S_model"]) for row in rows], "-", color="C0", label="(h/e)_S(E) fit")
+        plt.plot(energies, [float(row["h_over_e_C_model"]) for row in rows], "-", color="C1", label="(h/e)_C(E) fit")
+        plt.xscale("log")
     plt.xlabel("Beam energy [GeV]")
     plt.ylabel("h/e")
     plt.xticks(energies)
@@ -362,7 +368,7 @@ def main() -> None:
     out = ensure_dir(args.out)
     # plot_electron_linearity(tables, out)
     # plot_response_vs_fem(tables, out)
-    # plot_h_over_e_vs_energy(tables, out)
+    plot_h_over_e_vs_energy(tables, out)
     plot_energy_distributions(tables, out, args.energy_gev)
     # plot_fem_reco(tables, out)
     # plot_fem_distributions_by_sample(tables, out)

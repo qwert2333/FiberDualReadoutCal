@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,10 +26,17 @@
 
 namespace {
 
-const TString kRunDir = "/Users/fangyi/WorkingArea/DualReadoutTileCal/run_cellopt";
-const TString kOutputDir = kRunDir + "/full_dualreadout_new";
+// Set by RunFullDualReadout(inputDir, outputDir).  Relative paths are taken
+// from the directory where ROOT is started (the repository root).
+TString kRunDir = "data";
+TString kOutputDir = "outputs/full_dualreadout";
 const int kNEnergy = 6;
-double kEnergyGeV[kNEnergy] = {5., 10., 20., 30., 40., 50.};
+
+// FiberDualReadoutCal eventTree branches.
+const char* kScintBranch = "counter_Scintillation_ScintFiber";
+const char* kCherenkovBranch = "counter_Cerenkov_CherenkovFiber";
+const char* kScintEdepBranch = "EdepScintFiber";
+const char* kCherenkovEdepBranch = "EdepCherenkovFiber";
 
 struct SampleInfo {
   TString fileName;
@@ -174,30 +182,45 @@ TString NtupleDir(const StructureInfo& structure)
   return Form("%s/%s/ntuples", kOutputDir.Data(), structure.label.Data());
 }
 
+// Structure label = file name without "_<particle>_<E>GeV.root", e.g.
+// FiberDualReadoutCalo_Size1000x1000x2500mm_FiberD1.00mm_Pitch1.50mm_AbsCu_NZ125.
+// Files are searched in kRunDir and one level of subdirectories.
+TString StructureLabel(const std::string& fileName, const std::string& particle)
+{
+  return TString(fileName.substr(0, fileName.find("_" + particle + "_")));
+}
+
 std::vector<StructureInfo> FindStructures()
 {
-  std::vector<StructureInfo> structures;
+  std::map<TString, StructureInfo> byLabel;
+  auto addFile = [&](const std::filesystem::path& filePath) {
+    const std::string path = filePath.string();
+    const std::string name = filePath.filename().string();
+    if (!EndsWith(path, ".root")) return;
+    double energyGeV = 0.;
+    if (ParseEnergy(name, "e-", energyGeV)) {
+      auto& structure = byLabel[StructureLabel(name, "e-")];
+      structure.electronSamples.push_back({path, energyGeV});
+    } else if (ParseEnergy(name, "pi-", energyGeV)) {
+      auto& structure = byLabel[StructureLabel(name, "pi-")];
+      structure.pionSamples.push_back({path, energyGeV});
+    }
+  };
+
   for (const auto& entry : std::filesystem::directory_iterator(kRunDir.Data())) {
-    if (!entry.is_directory()) continue;
-
-    StructureInfo structure;
-    structure.directory = entry.path().string();
-    structure.label = entry.path().filename().string();
-    if (IsIgnoredDirectory(structure.label)) continue;
-
-    for (const auto& fileEntry : std::filesystem::directory_iterator(entry.path())) {
-      if (!fileEntry.is_regular_file()) continue;
-      const std::string path = fileEntry.path().string();
-      if (!EndsWith(path, ".root")) continue;
-
-      double energyGeV = 0.;
-      if (ParseEnergy(path, "e-", energyGeV)) {
-        structure.electronSamples.push_back({path, energyGeV});
-      } else if (ParseEnergy(path, "pi-", energyGeV)) {
-        structure.pionSamples.push_back({path, energyGeV});
+    if (entry.is_regular_file()) {
+      addFile(entry.path());
+    } else if (entry.is_directory() && !IsIgnoredDirectory(entry.path().filename().string())) {
+      for (const auto& fileEntry : std::filesystem::directory_iterator(entry.path())) {
+        if (fileEntry.is_regular_file()) addFile(fileEntry.path());
       }
     }
+  }
 
+  std::vector<StructureInfo> structures;
+  for (auto& [label, structure] : byLabel) {
+    structure.label = label;
+    structure.directory = kRunDir;
     std::sort(structure.electronSamples.begin(), structure.electronSamples.end(),
               [](const auto& lhs, const auto& rhs) { return lhs.energyGeV < rhs.energyGeV; });
     std::sort(structure.pionSamples.begin(), structure.pionSamples.end(),
@@ -205,11 +228,11 @@ std::vector<StructureInfo> FindStructures()
 
     if (structure.electronSamples.size() == kNEnergy && structure.pionSamples.size() == kNEnergy) {
       structures.push_back(structure);
+    } else {
+      std::cout << "Skip " << label << ": " << structure.electronSamples.size() << " e- and "
+                << structure.pionSamples.size() << " pi- samples, need " << kNEnergy << " each" << std::endl;
     }
   }
-
-  std::sort(structures.begin(), structures.end(),
-            [](const auto& lhs, const auto& rhs) { return lhs.label < rhs.label; });
   return structures;
 }
 
@@ -316,9 +339,15 @@ bool ReadChannelValues(const SampleInfo& sample, std::vector<double>& scint, std
   int scintReadout = 0;
   int cherenkovReadout = 0;
   double mcTruthEnergy = 0.;
-  tree->SetBranchAddress("counter_Scintillation_ScintLayer", &scintReadout);
-  tree->SetBranchAddress("counter_Cerenkov_CherenkovLayer", &cherenkovReadout);
-  if (truth) tree->SetBranchAddress("MCtruth_energy", &mcTruthEnergy);
+  tree->SetBranchStatus("*", 0);
+  tree->SetBranchStatus(kScintBranch, 1);
+  tree->SetBranchStatus(kCherenkovBranch, 1);
+  tree->SetBranchAddress(kScintBranch, &scintReadout);
+  tree->SetBranchAddress(kCherenkovBranch, &cherenkovReadout);
+  if (truth) {
+    tree->SetBranchStatus("MCtruth_energy", 1);
+    tree->SetBranchAddress("MCtruth_energy", &mcTruthEnergy);
+  }
 
   scint.clear();
   cherenkov.clear();
@@ -352,8 +381,11 @@ bool ReadEdepLayerValues(const SampleInfo& sample, std::vector<double>& scintEde
 
   double scintEdep = 0.;
   double cherenkovEdep = 0.;
-  tree->SetBranchAddress("EdepScintLayer", &scintEdep);
-  tree->SetBranchAddress("EdepCherenkovLayer", &cherenkovEdep);
+  tree->SetBranchStatus("*", 0);
+  tree->SetBranchStatus(kScintEdepBranch, 1);
+  tree->SetBranchStatus(kCherenkovEdepBranch, 1);
+  tree->SetBranchAddress(kScintEdepBranch, &scintEdep);
+  tree->SetBranchAddress(kCherenkovEdepBranch, &cherenkovEdep);
 
   scintEdepMeV.clear();
   cherenkovEdepMeV.clear();
@@ -405,9 +437,9 @@ void AnalyzeSamplingFractions(const StructureInfo& structure)
   gSystem->mkdir(TableDir(structure), true);
   std::ofstream pointCsv(Form("%s/edep_layer_sampling_points.csv", TableDir(structure).Data()));
   pointCsv << "structure,particle,energy_GeV,entries,"
-           << "EdepScintLayer_mean_MeV,EdepScintLayer_rms_MeV,EdepScintLayer_mean_err_MeV,"
-           << "EdepCherenkovLayer_mean_MeV,EdepCherenkovLayer_rms_MeV,EdepCherenkovLayer_mean_err_MeV,"
-           << "EdepScintLayer_mean_over_Ebeam,EdepCherenkovLayer_mean_over_Ebeam\n";
+           << "EdepScintFiber_mean_MeV,EdepScintFiber_rms_MeV,EdepScintFiber_mean_err_MeV,"
+           << "EdepCherenkovFiber_mean_MeV,EdepCherenkovFiber_rms_MeV,EdepCherenkovFiber_mean_err_MeV,"
+           << "EdepScintFiber_mean_over_Ebeam,EdepCherenkovFiber_mean_over_Ebeam\n";
   const auto writePoint = [&](const char* particle, const EdepLayerSummary& point) {
     const double beamMeV = 1000. * point.energyGeV;
     pointCsv << structure.label << "," << particle << "," << point.energyGeV << ","
@@ -487,10 +519,10 @@ void AnalyzeSamplingFractions(const StructureInfo& structure)
            << fit->GetChisquare() << "," << fit->GetNDF() << ","
            << "\"mean_Edep_MeV=slope*Ebeam_GeV\"\n";
   };
-  writeFit("e-", "scintillation_layer", "EdepScintLayer", "EM", fitEScint);
-  writeFit("e-", "cherenkov_layer", "EdepCherenkovLayer", "EM", fitECherenkov);
-  writeFit("pi-", "scintillation_layer", "EdepScintLayer", "hadronic_effective", fitPiScint);
-  writeFit("pi-", "cherenkov_layer", "EdepCherenkovLayer", "hadronic_effective", fitPiCherenkov);
+  writeFit("e-", "scintillation_fiber", kScintEdepBranch, "EM", fitEScint);
+  writeFit("e-", "cherenkov_fiber", kCherenkovEdepBranch, "EM", fitECherenkov);
+  writeFit("pi-", "scintillation_fiber", kScintEdepBranch, "hadronic_effective", fitPiScint);
+  writeFit("pi-", "cherenkov_fiber", kCherenkovEdepBranch, "hadronic_effective", fitPiCherenkov);
   fitCsv.close();
 
   gSystem->mkdir(PlotDir(structure), true);
@@ -522,10 +554,10 @@ void AnalyzeSamplingFractions(const StructureInfo& structure)
   auto* legend = new TLegend(0.15, 0.60, 0.6, 0.88);
   legend->SetBorderSize(0);
   legend->SetFillStyle(0);
-  legend->AddEntry(graphEScint, Form("e^{-} EdepScintLayer: f = %.4f", fitEScint->GetParameter(0) / 1000.), "lep");
-  legend->AddEntry(graphECherenkov, Form("e^{-} EdepCherenkovLayer: f = %.4f", fitECherenkov->GetParameter(0) / 1000.), "lep");
-  legend->AddEntry(graphPiScint, Form("#pi^{-} EdepScintLayer: f = %.4f", fitPiScint->GetParameter(0) / 1000.), "lep");
-  legend->AddEntry(graphPiCherenkov, Form("#pi^{-} EdepCherenkovLayer: f = %.4f", fitPiCherenkov->GetParameter(0) / 1000.), "lep");
+  legend->AddEntry(graphEScint, Form("e^{-} EdepScintFiber: f = %.4f", fitEScint->GetParameter(0) / 1000.), "lep");
+  legend->AddEntry(graphECherenkov, Form("e^{-} EdepCherenkovFiber: f = %.4f", fitECherenkov->GetParameter(0) / 1000.), "lep");
+  legend->AddEntry(graphPiScint, Form("#pi^{-} EdepScintFiber: f = %.4f", fitPiScint->GetParameter(0) / 1000.), "lep");
+  legend->AddEntry(graphPiCherenkov, Form("#pi^{-} EdepCherenkovFiber: f = %.4f", fitPiCherenkov->GetParameter(0) / 1000.), "lep");
   legend->Draw();
 
   canvas->SaveAs(Form("%s/edep_layer_sampling_fraction.pdf", PlotDir(structure).Data()));
@@ -635,11 +667,11 @@ Calibration CalibrateAndPlotElectrons(const StructureInfo& structure)
   csv << "structure,channel,branch,energy_GeV,entries,calibration_MeV_per_readout,"
       << "mean_GeV,mpv_GeV,sigma68_GeV,resolution_percent,resolution_error_percent\n";
   for (int i = 0; i < kNEnergy; ++i) {
-    csv << structure.label << ",S,counter_Scintillation_ScintLayer," << sResults[i].energyGeV << ","
+    csv << structure.label << ",S," << kScintBranch << "," << sResults[i].energyGeV << ","
         << sResults[i].entries << "," << calibration.scintMeVPerReadout << ","
         << sResults[i].meanGeV << "," << sResults[i].mpvGeV << "," << sResults[i].sigma68GeV << ","
         << sResults[i].resolutionPct << "," << sResults[i].resolutionErrPct << "\n";
-    csv << structure.label << ",C,counter_Cerenkov_CherenkovLayer," << cResults[i].energyGeV << ","
+    csv << structure.label << ",C," << kCherenkovBranch << "," << cResults[i].energyGeV << ","
         << cResults[i].entries << "," << calibration.cherenkovMeVPerReadout << ","
         << cResults[i].meanGeV << "," << cResults[i].mpvGeV << "," << cResults[i].sigma68GeV << ","
         << cResults[i].resolutionPct << "," << cResults[i].resolutionErrPct << "\n";
@@ -739,10 +771,14 @@ HoverEResult FitHoverEOneEnergy(const StructureInfo& structure, const SampleInfo
   double mcTruthEnergy = 0.;
   int scintReadout = 0;
   int cherenkovReadout = 0;
+  tree->SetBranchStatus("*", 0);
+  for (const char* branch : {"truthEdepEM", "MCtruth_energy", kScintBranch, kCherenkovBranch}) {
+    tree->SetBranchStatus(branch, 1);
+  }
   tree->SetBranchAddress("truthEdepEM", &truthEdepEM);
   tree->SetBranchAddress("MCtruth_energy", &mcTruthEnergy);
-  tree->SetBranchAddress("counter_Scintillation_ScintLayer", &scintReadout);
-  tree->SetBranchAddress("counter_Cerenkov_CherenkovLayer", &cherenkovReadout);
+  tree->SetBranchAddress(kScintBranch, &scintReadout);
+  tree->SetBranchAddress(kCherenkovBranch, &cherenkovReadout);
 
   auto* profileS = new TProfile(Form("prof_S_%s_%s", SafeName(structure.label).Data(),
                                      EnergyLabel(sample.energyGeV).Data()), ";truth f_{EM};S/E", 20, 0., 1.);
@@ -994,8 +1030,8 @@ ReconstructionResults ProcessDualReadoutSample(const StructureInfo& structure, c
   int scintReadout = 0;
   int cherenkovReadout = 0;
   double truthEdepEM = 0.;
-  inputTree->SetBranchAddress("counter_Scintillation_ScintLayer", &scintReadout);
-  inputTree->SetBranchAddress("counter_Cerenkov_CherenkovLayer", &cherenkovReadout);
+  inputTree->SetBranchAddress(kScintBranch, &scintReadout);
+  inputTree->SetBranchAddress(kCherenkovBranch, &cherenkovReadout);
   inputTree->SetBranchAddress("truthEdepEM", &truthEdepEM);
 
   const double hoverES = HoverES(hoverEFit, sample.energyGeV);
@@ -1010,10 +1046,15 @@ ReconstructionResults ProcessDualReadoutSample(const StructureInfo& structure, c
   }
 
   const char* vectorBranches[] = {
-      "Edep_Layer",
-      "Nph_Cherenkov_Layer",
-      "Nph_Scint_Layer",
+      "Edep_ScintFiber_Layer",
+      "Edep_CherenkovFiber_Layer",
+      "Edep_Absorber_Layer",
+      "Nph_Cerenkov_ScintFiber_Layer",
+      "Nph_Scintillation_ScintFiber_Layer",
+      "Nph_Cerenkov_CherenkovFiber_Layer",
+      "Nph_Scintillation_CherenkovFiber_Layer",
       "vecCellID",
+      "vecFiberType",
       "vecEdep",
       "vecNChren",
       "vecNScint"
@@ -1665,8 +1706,10 @@ void BuildDualReadout(const StructureInfo& structure, const Calibration& calibra
 
 }  // namespace
 
-void RunFullDualReadout()
+void RunFullDualReadout(const char* inputDir = "data", const char* outputDir = "outputs/full_dualreadout")
 {
+  kRunDir = inputDir;
+  kOutputDir = outputDir;
   gStyle->SetOptStat(0);
   const auto structures = FindStructures();
   std::cout << "Found " << structures.size() << " complete structures." << std::endl;

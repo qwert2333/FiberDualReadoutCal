@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Analyze hadron samples with electron calibration constants."""
+"""Analyze hadron samples with electron calibration constants.
+
+Follows S.Y. Jang et al., NIM A 1090 (2026) 171598, Sec. 4.4.1, extended to
+an energy-dependent h/e:
+  1. at each beam energy, (h/e)_S and (h/e)_C from the profile of S/E and C/E
+     versus the f_em of Eq. 11, fitted with R = p1 + p0 f_em;
+  2. fit h/e(E) = a + b ln(E/GeV) (or a + b E) for each channel;
+  3. chi(E) = (1 - (h/e)_S(E)) / (1 - (h/e)_C(E)) at the beam energy,
+     E_DR = (S - chi C) / (1 - chi).
+"""
 
 from __future__ import annotations
 
@@ -7,15 +16,21 @@ import argparse
 import math
 from pathlib import Path
 
+from collections import defaultdict
+
 from common import (
+    chi_from_h_over_e,
+    fem_from_ratio,
     find_root_files,
     finite,
-    fit_response_vs_fem,
     load_events,
     mean,
+    paper_h_over_e,
     read_json,
     require_columns,
     rms,
+    stderr,
+    weighted_line_fit,
     write_csv,
     write_json,
     repo_path,
@@ -27,30 +42,21 @@ def reco_events(path: Path, a_s: float, a_c: float) -> tuple[list[dict], dict]:
     events = load_events(path)
     s_column = "counter_Scintillation_ScintFiber"
     c_column = "counter_Cerenkov_CherenkovFiber"
-    fem_column = "truthFemScint"
-    require_columns(events, ["MCtruth_energy", s_column, c_column, fem_column], path)
+    fem_column = "truthFem"
+    require_columns(events, ["MCtruth_energy", s_column, c_column, fem_column, "truthFemScint"], path)
 
     rows = []
     rejected = {
-        "truthFem_lt_0": 0,
-        "truthFem_eq_0": 0,
         "S_raw_le_0": 0,
         "C_raw_le_0": 0,
         "energy_le_0": 0,
     }
     for row in events:
         energy = float(row["MCtruth_energy"])
-        fem = float(row[fem_column])
         s_raw = float(row[s_column])
         c_raw = float(row[c_column])
         if energy <= 0:
             rejected["energy_le_0"] += 1
-            continue
-        if fem < 0:
-            rejected["truthFem_lt_0"] += 1
-            continue
-        if fem == 0:
-            rejected["truthFem_eq_0"] += 1
             continue
         if s_raw <= 0:
             rejected["S_raw_le_0"] += 1
@@ -75,8 +81,9 @@ def reco_events(path: Path, a_s: float, a_c: float) -> tuple[list[dict], dict]:
             "C_cal": c_cal,
             "S_cal_over_E": s_cal / energy,
             "C_cal_over_E": c_cal / energy,
-            "truthFemCrystal": fem,
-            "truthFemScint": fem,
+            "truthFem": float(row[fem_column]),
+            "truthFemCrystal": float(row["truthFemScint"]),
+            "truthFemScint": float(row["truthFemScint"]),
             "leakageEnergy": leakage,
             "leakageFraction": leakage_fraction,
             "EdepScintFiber": float(row.get("EdepScintFiber", math.nan)),
@@ -88,100 +95,113 @@ def reco_events(path: Path, a_s: float, a_c: float) -> tuple[list[dict], dict]:
     return rows, rejected
 
 
-def solve_2x2(m00: float, m01: float, m11: float, v0: float, v1: float) -> tuple[float, float]:
-    det = m00 * m11 - m01 * m01
-    if abs(det) < 1e-18:
-        return math.nan, math.nan
-    return (v0 * m11 - v1 * m01) / det, (m00 * v1 - m01 * v0) / det
-
-
-def fit_linear_energy(rows: list[dict]) -> dict:
-    m00 = sum(float(row["S_cal"]) * float(row["S_cal"]) for row in rows)
-    m01 = sum(float(row["S_cal"]) * float(row["C_cal"]) for row in rows)
-    m11 = sum(float(row["C_cal"]) * float(row["C_cal"]) for row in rows)
-    v0 = sum(float(row["S_cal"]) * float(row["energy_MeV"]) for row in rows)
-    v1 = sum(float(row["C_cal"]) * float(row["energy_MeV"]) for row in rows)
-    a, b = solve_2x2(m00, m01, m11, v0, v1)
-    chi = -b / a if finite(a) and abs(a) > 1e-18 else math.nan
-    return {"method": "linear_energy_fit", "fit_a": a, "fit_b": b, "chi": chi}
-
-
-def summarize_subset(rows: list[dict], label: str, h_s: float, h_c: float, dr_fit: dict) -> dict:
-    if not rows:
-        return {"subset": label, "n_events": 0}
-    chi = float(dr_fit["chi"])
+def group_by_energy(rows: list[dict]) -> dict[float, list[dict]]:
+    groups: dict[float, list[dict]] = defaultdict(list)
     for row in rows:
-        energy = float(row["energy_MeV"])
-        s_cal = float(row["S_cal"])
-        c_cal = float(row["C_cal"])
-        if finite(chi) and abs(1.0 - chi) > 1e-12:
+        groups[float(row["energy_GeV"])].append(row)
+    return dict(sorted(groups.items()))
+
+
+def h_over_e_by_energy(groups: dict[float, list[dict]]) -> list[dict]:
+    """Paper method (Sec. 4.4.1) applied separately at each beam energy."""
+    points = []
+    for energy, sample in groups.items():
+        result = paper_h_over_e(
+            [float(row["S_cal_over_E"]) for row in sample],
+            [float(row["C_cal_over_E"]) for row in sample],
+            [float(row["truthFem"]) for row in sample],
+        )
+        fit_s, fit_c = result["S"], result["C"]
+        points.append({
+            "energy_GeV": energy,
+            "n_events": len(sample),
+            "h_over_e_S": fit_s["h_over_e"],
+            "h_over_e_S_err": fit_s["h_over_e_err"],
+            "p1_S": fit_s["p1"],
+            "p0_S": fit_s["p0"],
+            "h_over_e_C": fit_c["h_over_e"],
+            "h_over_e_C_err": fit_c["h_over_e_err"],
+            "p1_C": fit_c["p1"],
+            "p0_C": fit_c["p0"],
+            "chi_point": chi_from_h_over_e(fit_s["h_over_e"], fit_c["h_over_e"]),
+            "seed_h_over_e_S_truthFem": result["seed_S"]["h_over_e"],
+            "seed_h_over_e_C_truthFem": result["seed_C"]["h_over_e"],
+        })
+    return points
+
+
+def hoe_variable(energy_gev: float, model: str) -> float:
+    return math.log(energy_gev) if model == "log" else energy_gev
+
+
+def fit_h_over_e_model(points: list[dict], model: str, emin: float) -> dict:
+    """Fit h/e(E) = intercept + slope * x, x = ln(E/GeV) (log) or E/GeV (linear)."""
+    used = [row for row in points if row["energy_GeV"] >= emin]
+    out = {"model": model, "variable": "ln(E/GeV)" if model == "log" else "E/GeV", "fit_emin_GeV": emin,
+           "fit_energies_GeV": [row["energy_GeV"] for row in used]}
+    for channel in ("S", "C"):
+        fit = weighted_line_fit(
+            [hoe_variable(row["energy_GeV"], model) for row in used],
+            [row[f"h_over_e_{channel}"] for row in used],
+            [row[f"h_over_e_{channel}_err"] for row in used],
+        )
+        out[channel] = {
+            "intercept": fit["intercept"],
+            "intercept_err": math.sqrt(fit["var_intercept"]),
+            "slope": fit["slope"],
+            "slope_err": math.sqrt(fit["var_slope"]),
+            "chi2": fit["chi2"],
+            "ndf": fit["ndf"],
+        }
+    return out
+
+
+def h_over_e_at(model_fit: dict, channel: str, energy_gev: float) -> float:
+    params = model_fit[channel]
+    return params["intercept"] + params["slope"] * hoe_variable(energy_gev, model_fit["model"])
+
+
+def reconstruct(groups: dict[float, list[dict]], model_fit: dict) -> list[dict]:
+    """E_DR = (S - chi C)/(1 - chi) with chi from h/e(E) at the beam energy (paper Eq. 9)."""
+    summaries = []
+    for energy, sample in groups.items():
+        h_s = h_over_e_at(model_fit, "S", energy)
+        h_c = h_over_e_at(model_fit, "C", energy)
+        chi = chi_from_h_over_e(h_s, h_c)
+        for row in sample:
+            s_cal = float(row["S_cal"])
+            c_cal = float(row["C_cal"])
             e_dr = (s_cal - chi * c_cal) / (1.0 - chi)
-        else:
-            e_dr = math.nan
-        row["chi"] = chi
-        row["E_DR"] = e_dr
-        row["E_DR_over_E"] = e_dr / energy if finite(e_dr) and energy > 0 else math.nan
-        if finite(e_dr) and abs(1.0 - h_s) > 1e-12 and abs(e_dr) > 1e-12:
-            row["fem_DR"] = (s_cal / e_dr - h_s) / (1.0 - h_s)
-        else:
-            row["fem_DR"] = math.nan
+            row["h_over_e_S"] = h_s
+            row["h_over_e_C"] = h_c
+            row["chi"] = chi
+            row["E_DR"] = e_dr
+            row["E_DR_over_E"] = e_dr / float(row["energy_MeV"])
+            row["fem_DR"] = fem_from_ratio(float(row["S_cal_over_E"]), float(row["C_cal_over_E"]), h_s, h_c)
 
-    e_s = [float(row["S_cal_over_E"]) for row in rows]
-    e_c = [float(row["C_cal_over_E"]) for row in rows]
-    e_dr = [float(row["E_DR_over_E"]) for row in rows if finite(float(row["E_DR_over_E"]))]
-    fem_delta = [
-        float(row["fem_DR"]) - float(row["truthFemCrystal"])
-        for row in rows
-        if finite(float(row["fem_DR"]))
-    ]
-    return {
-        "subset": label,
-        "n_events": len(rows),
-        "h_over_e_S": h_s,
-        "h_over_e_C": h_c,
-        "dual_readout_method": dr_fit["method"],
-        "chi": chi,
-        "linear_fit_a": dr_fit["fit_a"],
-        "linear_fit_b": dr_fit["fit_b"],
-        "mean_S_over_E": mean(e_s),
-        "rms_S_over_E": rms(e_s),
-        "mean_C_over_E": mean(e_c),
-        "rms_C_over_E": rms(e_c),
-        "mean_DR_over_E": mean(e_dr),
-        "rms_DR_over_E": rms(e_dr),
-        "resolution_DR": rms(e_dr) / mean(e_dr) if e_dr and mean(e_dr) != 0 else math.nan,
-        "mean_fem_DR_minus_truth": mean(fem_delta) if fem_delta else math.nan,
-        "rms_fem_DR_minus_truth": rms(fem_delta) if fem_delta else math.nan,
-    }
-
-
-def fit_and_summarize(rows: list[dict], label: str) -> tuple[dict, list[dict]]:
-    fem = [float(row["truthFemCrystal"]) for row in rows]
-    s_response = [float(row["S_cal_over_E"]) for row in rows]
-    c_response = [float(row["C_cal_over_E"]) for row in rows]
-    fit_s = fit_response_vs_fem(fem, s_response)
-    fit_c = fit_response_vs_fem(fem, c_response)
-    dr_fit = fit_linear_energy(rows)
-    summary = summarize_subset(rows, label, fit_s["h_over_e"], fit_c["h_over_e"], dr_fit)
-    summary.update({
-        "h_over_e_S_err": fit_s["h_over_e_err"],
-        "h_over_e_C_err": fit_c["h_over_e_err"],
-        "fit_rms_S": fit_s["fit_rms"],
-        "fit_rms_C": fit_c["fit_rms"],
-    })
-    response_rows = [
-        {"subset": label, "channel": "S", **fit_s},
-        {"subset": label, "channel": "C", **fit_c},
-    ]
-    return summary, response_rows
+        summary = {"energy_GeV": energy, "n_events": len(sample),
+                   "h_over_e_S_model": h_s, "h_over_e_C_model": h_c, "chi": chi}
+        for name, key in (("S", "S_cal_over_E"), ("C", "C_cal_over_E"), ("DR", "E_DR_over_E")):
+            values = [float(row[key]) for row in sample]
+            mu = mean(values)
+            summary[f"mean_{name}_over_E"] = mu
+            summary[f"mean_{name}_over_E_err"] = stderr(values)
+            summary[f"resolution_{name}"] = rms(values) / mu
+        fem_delta = [float(row["fem_DR"]) - float(row["truthFem"]) for row in sample if finite(float(row["fem_DR"]))]
+        summary["mean_fem_DR_minus_truthFem"] = mean(fem_delta)
+        summary["rms_fem_DR_minus_truthFem"] = rms(fem_delta)
+        summaries.append(summary)
+    return summaries
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--input", required=True, help="Directory containing hadron ROOT files")
     parser.add_argument("--calib", required=True, help="electron_calibration.json")
     parser.add_argument("--out", required=True, help="Output table directory")
-    parser.add_argument("--contained-leakage-max", type=float, default=0.05)
+    parser.add_argument("--hoe-model", choices=["log", "linear"], default="log",
+                        help="h/e(E) = a + b ln(E/GeV) (log, default) or a + b E (linear)")
+    parser.add_argument("--hoe-emin", type=float, default=0.0, help="Lowest beam energy [GeV] in the h/e(E) fit")
     args = parser.parse_args()
 
     calibration = read_json(args.calib)["calibration"]
@@ -208,43 +228,46 @@ def main() -> None:
     if not all_rows:
         raise SystemExit("No valid hadron events after quality cuts")
 
-    has_leakage = any(finite(float(row["leakageFraction"])) for row in all_rows)
-    contained = [
-        row for row in all_rows
-        if finite(float(row["leakageFraction"])) and float(row["leakageFraction"]) < args.contained_leakage_max
-    ] if has_leakage else []
-    summary_all, response_all = fit_and_summarize(all_rows, "all")
-    if contained:
-        summary_contained, response_contained = fit_and_summarize(contained, "contained")
-    else:
-        summary_contained, response_contained = ({"subset": "contained", "n_events": 0}, [])
+    groups = group_by_energy(all_rows)
+    hoe_points = h_over_e_by_energy(groups)
+    model_fit = fit_h_over_e_model(hoe_points, args.hoe_model, args.hoe_emin)
+    for row in hoe_points:
+        for channel in ("S", "C"):
+            row[f"h_over_e_{channel}_model"] = h_over_e_at(model_fit, channel, row["energy_GeV"])
+        row["chi_model"] = chi_from_h_over_e(row["h_over_e_S_model"], row["h_over_e_C_model"])
+    summaries = reconstruct(groups, model_fit)
 
-    response_rows = response_all + response_contained
     summary = {
         "calibration_file": str(repo_path(args.calib).relative_to(repo_path("."))),
-        "contained_leakage_max": args.contained_leakage_max,
-        "leakage_available": has_leakage,
+        "reference": "S.Y. Jang et al., NIM A 1090 (2026) 171598, Sec. 4.4.1, Eqs. 9-13",
         "signal_definitions": {
             "S_raw": "counter_Scintillation_ScintFiber",
             "C_raw": "counter_Cerenkov_CherenkovFiber",
-            "truth_fem": "truthFemScint",
-            "E_DR": "linear_energy_fit: E_beam = a*S + b*C, chi = -b/a, E_DR = (S - chi*C)/(1 - chi)",
+            "truth_fem": "truthFem (seed for Eq. 11 only)",
+            "h_over_e": "per energy: profile of S/E, C/E vs f_em(Eq. 11), fit R = p1 + p0 f_em, h/e = p1/(p0+p1)",
+            "E_DR": "chi(E_beam) from the h/e(E) fit, E_DR = (S - chi*C)/(1 - chi)",
         },
+        "h_over_e_model": model_fit,
         "rejected_by_file": rejected_by_file,
-        "subsets": [summary_all, summary_contained],
+        "per_energy": summaries,
     }
 
-    write_csv(out_dir / "hadron_response.csv", response_rows)
+    write_csv(out_dir / "h_over_e_vs_energy.csv", hoe_points)
+    write_csv(out_dir / "hadron_response.csv", summaries)
     write_csv(out_dir / "event_reco.csv", all_rows)
     write_json(out_dir / "dual_readout_summary.json", summary)
+    print(f"Wrote {out_dir / 'h_over_e_vs_energy.csv'}")
     print(f"Wrote {out_dir / 'hadron_response.csv'}")
     print(f"Wrote {out_dir / 'event_reco.csv'}")
     print(f"Wrote {out_dir / 'dual_readout_summary.json'}")
-    print(f"all-events h/e S={summary_all['h_over_e_S']:.5g}, C={summary_all['h_over_e_C']:.5g}")
-    print(f"all-events linear chi={summary_all['chi']:.5g}, a={summary_all['linear_fit_a']:.5g}, b={summary_all['linear_fit_b']:.5g}")
-    if contained:
-        print(f"contained h/e S={summary_contained['h_over_e_S']:.5g}, C={summary_contained['h_over_e_C']:.5g}")
-        print(f"contained linear chi={summary_contained['chi']:.5g}, a={summary_contained['linear_fit_a']:.5g}, b={summary_contained['linear_fit_b']:.5g}")
+    for channel in ("S", "C"):
+        params = model_fit[channel]
+        print(f"(h/e)_{channel}(E) = {params['intercept']:.4f} + {params['slope']:.4f} * {model_fit['variable']}"
+              f"   chi2/ndf = {params['chi2']:.1f}/{params['ndf']}")
+    for row, summ in zip(hoe_points, summaries):
+        print(f"{row['energy_GeV']:>4g} GeV: h/e S={row['h_over_e_S']:.4f}+-{row['h_over_e_S_err']:.4f} "
+              f"C={row['h_over_e_C']:.4f}+-{row['h_over_e_C_err']:.4f}  chi(model)={summ['chi']:.4f}  "
+              f"<DR>/E={summ['mean_DR_over_E']:.4f}  res DR={100*summ['resolution_DR']:.2f}%")
 
 
 if __name__ == "__main__":

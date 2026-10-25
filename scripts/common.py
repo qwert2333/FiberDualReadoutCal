@@ -344,13 +344,13 @@ def export_root_to_csv(root_file: str | Path, out_csv: str | Path, columns: Sequ
         var = _cpp_var_name(column)
         if column == "particle":
             declarations.append(f"  Char_t {var}[64];")
-            branch_addresses.append(f'  t->SetBranchAddress("{branch}", {var});')
+            branch_addresses.append(f'  t->SetBranchStatus("{branch}", 1); t->SetBranchAddress("{branch}", {var});')
         elif column in int_columns:
             declarations.append(f"  Int_t {var} = 0;")
-            branch_addresses.append(f'  t->SetBranchAddress("{branch}", &{var});')
+            branch_addresses.append(f'  t->SetBranchStatus("{branch}", 1); t->SetBranchAddress("{branch}", &{var});')
         else:
             declarations.append(f"  Double_t {var} = 0;")
-            branch_addresses.append(f'  t->SetBranchAddress("{branch}", &{var});')
+            branch_addresses.append(f'  t->SetBranchStatus("{branch}", 1); t->SetBranchAddress("{branch}", &{var});')
         output_terms.append(var)
 
     output_line = ' << "," << '.join(output_terms)
@@ -363,6 +363,7 @@ void export_tree() {{
   if (!f || f->IsZombie()) {{ std::cerr << "Could not open ROOT file\\n"; gSystem->Exit(2); }}
   auto t = (TTree*)f->Get("eventTree");
   if (!t) {{ std::cerr << "Missing eventTree\\n"; gSystem->Exit(3); }}
+  t->SetBranchStatus("*", 0);
 {chr(10).join(declarations)}
 {chr(10).join(branch_addresses)}
   std::ofstream out("{out_csv}");
@@ -378,3 +379,99 @@ void export_tree() {{
         macro_path = Path(tmp) / "export_tree.C"
         macro_path.write_text(macro)
         run_command(["root", "-l", "-b", "-q", f"{macro_path}"], cwd=REPO_ROOT)
+
+
+# Paper method (S.Y. Jang et al., NIM A 1090 (2026) 171598, Sec. 4.4.1).
+
+def fem_from_ratio(s_over_e: float, c_over_e: float, h_s: float, h_c: float) -> float:
+    """Event-by-event em fraction from the C/S ratio, paper Eq. 11."""
+    if s_over_e <= 0:
+        return math.nan
+    q = c_over_e / s_over_e
+    denom = q * (1.0 - h_s) - (1.0 - h_c)
+    return (h_c - q * h_s) / denom if abs(denom) > 1e-12 else math.nan
+
+
+def weighted_line_fit(x: Sequence[float], y: Sequence[float], err: Sequence[float]) -> Dict[str, Any]:
+    """Weighted least squares y = intercept + slope * x."""
+    w = [1.0 / (e * e) for e in err]
+    sw = sum(w)
+    sx = sum(wi * xi for wi, xi in zip(w, x))
+    sy = sum(wi * yi for wi, yi in zip(w, y))
+    sxx = sum(wi * xi * xi for wi, xi in zip(w, x))
+    sxy = sum(wi * xi * yi for wi, xi, yi in zip(w, x, y))
+    det = sw * sxx - sx * sx
+    intercept = (sxx * sy - sx * sxy) / det
+    slope = (sw * sxy - sx * sy) / det
+    chi2 = sum(wi * (yi - intercept - slope * xi) ** 2 for wi, xi, yi in zip(w, x, y))
+    return {
+        "intercept": intercept,
+        "slope": slope,
+        "var_intercept": sxx / det,
+        "var_slope": sw / det,
+        "cov": -sx / det,
+        "chi2": chi2,
+        "ndf": len(x) - 2,
+    }
+
+
+def profile_response_fit(fem: Sequence[float], response: Sequence[float],
+                         lo: float = 0.0, hi: float = 1.0, nbins: int = 20,
+                         min_entries: int = 10) -> Dict[str, Any]:
+    """Profile R = S/E or C/E in bins of f_em and fit R = p1 + p0 * f_em (paper Eq. 13).
+
+    e/h - 1 = p0 / p1, so h/e = p1 / (p0 + p1).
+    """
+    width = (hi - lo) / nbins
+    bins: List[List[tuple]] = [[] for _ in range(nbins)]
+    for f, r in zip(fem, response):
+        if finite(f) and lo <= f < hi:
+            bins[int((f - lo) / width)].append((f, r))
+    bin_x, bin_y, bin_err = [], [], []
+    for content in bins:
+        if len(content) < min_entries:
+            continue
+        bin_x.append(mean([f for f, _ in content]))
+        bin_y.append(mean([r for _, r in content]))
+        bin_err.append(stderr([r for _, r in content]))
+    fit = weighted_line_fit(bin_x, bin_y, bin_err)
+    p1, p0 = fit["intercept"], fit["slope"]
+    total = p0 + p1
+    h_over_e = p1 / total
+    # h/e = p1 / (p0 + p1): d/dp1 = p0/total^2, d/dp0 = -p1/total^2
+    g1, g0 = p0 / total ** 2, -p1 / total ** 2
+    var = g1 * g1 * fit["var_intercept"] + g0 * g0 * fit["var_slope"] + 2 * g1 * g0 * fit["cov"]
+    return {
+        "p1": p1,
+        "p0": p0,
+        "h_over_e": h_over_e,
+        "h_over_e_err": math.sqrt(max(var, 0.0)),
+        "profile_chi2": fit["chi2"],
+        "profile_ndf": fit["ndf"],
+        "n_fit": sum(len(content) for content in bins),
+        "bin_x": bin_x,
+        "bin_y": bin_y,
+        "bin_err": bin_err,
+    }
+
+
+def paper_h_over_e(s_over_e: Sequence[float], c_over_e: Sequence[float],
+                   truth_fem: Sequence[float]) -> Dict[str, Any]:
+    """(h/e)_S and (h/e)_C as in the paper: profile fit against the f_em of Eq. 11.
+
+    Eq. 11 needs (h/e) as input.  The seed is the same profile fit against the
+    truth f_em; one pass is made.  Iterating to a fixed point is not useful:
+    Eq. 11 depends on C/S only, so only chi is constrained and the individual
+    h/e values drift along a degenerate direction.
+    """
+    seed_s = profile_response_fit(truth_fem, s_over_e)
+    seed_c = profile_response_fit(truth_fem, c_over_e)
+    fem = [fem_from_ratio(s, c, seed_s["h_over_e"], seed_c["h_over_e"]) for s, c in zip(s_over_e, c_over_e)]
+    fit_s = profile_response_fit(fem, s_over_e)
+    fit_c = profile_response_fit(fem, c_over_e)
+    return {"S": fit_s, "C": fit_c, "seed_S": seed_s, "seed_C": seed_c, "fem_reco": fem}
+
+
+def chi_from_h_over_e(h_s: float, h_c: float) -> float:
+    """Paper Eq. 9."""
+    return (1.0 - h_s) / (1.0 - h_c)
